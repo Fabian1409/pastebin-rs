@@ -1,36 +1,57 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
-use uuid::Uuid;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const CLIPBOARD_SIZE: usize = 10;
+
+type SharedClipboard = Arc<RwLock<Clipboard>>;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Entry {
-    id: Uuid,
     data: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct NewEntry {
-    data: String,
+#[derive(Debug, Clone)]
+struct Clipboard {
+    queue: Vec<Entry>,
+    capacity: usize,
 }
 
-type Database = Arc<RwLock<HashMap<Uuid, Entry>>>;
+impl Clipboard {
+    fn add(&mut self, entry: Entry) {
+        if self.queue.len() == self.capacity {
+            self.queue.remove(0);
+        }
+        self.queue.push(entry);
+    }
+
+    fn get_entries(&self) -> Vec<Entry> {
+        self.queue.clone()
+    }
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Clipboard {
+            queue: vec![],
+            capacity: CLIPBOARD_SIZE,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -42,12 +63,11 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let db = Database::default();
+    let clipboard = SharedClipboard::default();
 
     let app = Router::new()
-        .route("/", get(|| async { "Hello, World!" }))
         .route("/paste", post(add_entry))
-        .route("/copy/:id", get(get_entry))
+        .route("/copy", get(get_entries))
         .layer(
             ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(|error: BoxError| async move {
@@ -64,9 +84,9 @@ async fn main() {
                 .layer(TraceLayer::new_for_http())
                 .into_inner(),
         )
-        .with_state(db);
+        .with_state(clipboard);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([192, 168, 0, 10], 3000));
     tracing::debug!("listening on {}", addr);
 
     axum::Server::bind(&addr)
@@ -75,27 +95,17 @@ async fn main() {
         .unwrap();
 }
 
-async fn add_entry(State(db): State<Database>, Json(input): Json<NewEntry>) -> impl IntoResponse {
-    let id = Uuid::new_v4();
-    let entry = Entry {
-        id,
-        data: input.data,
-    };
-
-    db.write().unwrap().insert(id, entry);
-    tracing::debug!("created clipboard entry with id={}", id);
-
-    (StatusCode::OK, Json(id))
+async fn add_entry(
+    State(clipboard): State<SharedClipboard>,
+    Json(entry): Json<Entry>,
+) -> impl IntoResponse {
+    clipboard.write().unwrap().add(entry);
+    tracing::debug!("added clipboard entry");
+    StatusCode::OK
 }
 
-async fn get_entry(
-    State(db): State<Database>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, StatusCode> {
-    tracing::debug!("fetching clipboard entry with id={}", id);
-    if let Some(entry) = db.read().unwrap().get(&id) {
-        Ok(Json(entry.clone()))
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
+async fn get_entries(State(clipboard): State<SharedClipboard>) -> impl IntoResponse {
+    tracing::debug!("fetching clipboard");
+    let entries = clipboard.read().unwrap().get_entries();
+    (StatusCode::OK, Json(entries))
 }
